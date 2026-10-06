@@ -1,0 +1,87 @@
+import { escapeHtml } from '../../../utils/richMessage.js';
+import { getCustomEmoji, escapeHtmlPreservingTgEmoji } from '../../../utils/customEmoji.js';
+import type { UserbotMessageLike, UserbotSettings } from '../../types.js';
+import type { CompatClient } from '../../engine/compatClient.js';
+
+// ============================================================
+// PROSES — kartu status transaksi (teks estetik HTML blockquote)
+//   .proses <item>  -> kartu ⏳ PROCESSING + timestamp WIB
+//   .done <item>    -> kartu ✅ DONE
+//   .batal <item>   -> kartu ❌ CANCELED
+// ============================================================
+
+function nowWib() {
+  return new Date().toLocaleString('id-ID', {
+    timeZone: 'Asia/Jakarta',
+    day: '2-digit',
+    month: '2-digit',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit'
+  });
+}
+
+const CARDS: Record<string, { label: string; statusId: string }> = {
+  proses: { label: 'PROCESSING', statusId: 'Sedang Diproses' },
+  done: { label: 'DONE', statusId: 'Selesai' },
+  batal: { label: 'CANCELED', statusId: 'Dibatalkan' }
+};
+
+function buildCard(kind: string, rawItem: string, settings?: unknown) {
+  const card = CARDS[kind];
+  const emoji = getCustomEmoji(settings, kind);
+  const itemEmoji = getCustomEmoji(settings, 'item');
+  const timeEmoji = getCustomEmoji(settings, 'time');
+  const item = rawItem.trim();
+  const time = nowWib();
+
+  return (
+    `${emoji} <b>${card.label}</b>\n\n` +
+    `<blockquote>${itemEmoji} <b>Item:</b> ${escapeHtmlPreservingTgEmoji(item)}\n` +
+    `🔖 <b>Status:</b> ${card.statusId}\n` +
+    `${timeEmoji} <b>Waktu (WIB):</b> <code>${escapeHtml(time)}</code></blockquote>\n\n` +
+    `<blockquote><i>Diproses otomatis oleh DeltaUbotJS</i></blockquote>`
+  );
+}
+
+async function sendCard(message: UserbotMessageLike, kind: string, rawItem: string, settings?: unknown) {
+  if (!rawItem || !rawItem.trim()) {
+    await message.edit({
+      text: `<blockquote>📚 <b>Penggunaan:</b> <code>.${kind} &lt;nama item&gt;</code>\nContoh: <code>.${kind} Panel Premium 1 Bulan</code></blockquote>`,
+      parseMode: 'html'
+    });
+    return;
+  }
+
+  await message.edit({
+    text: buildCard(kind, rawItem, settings),
+    parseMode: 'html'
+  });
+}
+
+export default {
+  name: 'proses',
+  version: '1.0.0',
+  description: 'Kartu status transaksi: proses, selesai, dan batal dengan gaya teks estetik.',
+  help: {
+    title: 'Status Transaksi (.proses / .done / .batal)',
+    description: 'Kirim kartu teks status transaksi bergaya estetik: processing, done, atau canceled — lengkap dengan timestamp WIB.',
+    usage: '• `.proses <item>` — kartu ⏳ PROCESSING + timestamp WIB\n' +
+      '• `.done <item>` — kartu ✅ DONE\n' +
+      '• `.batal <item>` — kartu ❌ CANCELED',
+    detail: 'Semua kartu dirender sebagai HTML blockquote: judul status, nama item, status dalam Bahasa Indonesia, dan waktu WIB (Asia/Jakarta). ' +
+      'Cocok untuk update cepat pembeli di chat transaksi.'
+  },
+  async execute(client: CompatClient, message: UserbotMessageLike, settings: UserbotSettings, _telegramId: number) {
+    if (!message.out || !message.message) {return;}
+
+    const match = message.message.trim().match(/^\.(\w+)(?:\s+([\s\S]+))?$/);
+    if (!match) {return;}
+
+    const cmd = match[1].toLowerCase();
+    if (cmd !== 'proses' && cmd !== 'done' && cmd !== 'batal') {return;}
+
+    await sendCard(message, cmd, match[2] || '', settings);
+  }
+};

@@ -1,0 +1,227 @@
+import type { UserbotMessageLike } from '../../types.js';
+import { escapeHtml } from '../../../utils/richMessage.js';
+import { Logger } from '../../../utils/logger.js';
+import type { CompatClient } from '../../engine/compatClient.js';
+import { toPeer } from '../../engine/compatClient.js';
+import type { EntityLike } from '../../types.js';
+import type { UserbotEntityLike } from '../../types.js';
+import type { LegacyEntity } from '../../engine/compatClient.js';
+
+/**
+ * Profiles — info pengguna & info grup/channel.
+ *
+ * .info  → hanya untuk reply ke pesan user (ambil via getSender + getChat),
+ *          kirim kartu info + foto profil besar (isBig: true) bila ada.
+ *          Catatan: plugin info.ts juga menangani .info (non-reply & username).
+ *          Supaya tidak dobel output, plugin ini cek ulang pesan perintah:
+ *          kalau sudah diedit/dihapus oleh info.ts, langsung skip.
+ * .cinfo → info grup/channel di chat saat ini (bisa reply maupun biasa):
+ *          nama, id, username, jumlah member, deskripsi.
+ * .id    → SUDAH ADA di plugin id.ts, tidak dibuat di sini.
+ */
+
+const _sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function statusTags(u: { premium?: boolean; bot?: boolean; verified?: boolean; scam?: boolean; fake?: boolean }): string {
+  const tags: string[] = [];
+  if (u.premium) {tags.push('💎 Premium');}
+  if (u.bot) {tags.push('🤖 Bot');}
+  if (u.verified) {tags.push('✅ Verified');}
+  if (u.scam) {tags.push('⚠️ Scam');}
+  if (u.fake) {tags.push('🎭 Fake');}
+  return tags.length > 0 ? tags.join(' · ') : 'Normal User';
+}
+
+/**
+ * Irisan field yang benar-benar dirender `.profiles`. Sumbernya bisa `FullUser`
+ * mtcute atau entity legacy dari `getEntity()`, jadi tipe ini sengaja hanya
+ * mendeskripsikan yang dipakai.
+ */
+type UserProfileView = {
+  id?: unknown;
+  firstName?: string;
+  lastName?: string;
+  username?: string;
+  bio?: string;
+  /** Hanya ada pada entity legacy. */
+  about?: string;
+  premium?: boolean;
+  bot?: boolean;
+  verified?: boolean;
+  scam?: boolean;
+  fake?: boolean;
+};
+
+export default {
+  name: 'profiles',
+  help: {
+    title: 'Profiles (.info / .cinfo)',
+    description: 'Info lengkap pengguna (nama, ID, username, bio, foto profil besar) dan info grup/channel (nama, ID, member, deskripsi).',
+    usage: '• `.info` — balas pesan user untuk melihat info + foto profil besarnya\n• `.cinfo` — lihat info grup/channel di chat saat ini (bisa juga sambil reply)',
+    detail: '• `.info` hanya aktif saat me-reply pesan seseorang; foto dikirim dalam ukuran besar jika profilnya punya foto.\n' +
+            '• `.info <username>` / `.info` tanpa reply ditangani plugin info (.info lain).\n' +
+            '• `.cinfo` menampilkan jumlah member lewat full-chat API (supergroup/channel) atau daftar participant (grup biasa).\n' +
+            '• `.id` untuk ID chat/user cepat ada di plugin terpisah.'
+  },
+  async execute(client: CompatClient, message: UserbotMessageLike, _settings: unknown, telegramId: number) {
+    if (!message.out || !message.message) {return;}
+    if (!message.peerId) {return;}
+
+    const args = message.message.trim().split(/\s+/);
+    const cmd = (args[0] || '').toLowerCase();
+
+    // ============================================================
+    // .info — reply ke pesan user → kartu info + foto profil besar
+    // ============================================================
+    if (cmd === '.info') {
+      const replied = await message.getReplyMessage();
+      if (!replied) {return;} // bukan reply → biarkan plugin info.ts yang menangani
+
+      try {
+        // Anti-dobel: kalau pesan perintah sudah diedit/dihapus plugin lain (info.ts), skip.
+        const fresh = (await client.getMessages(toPeer(message.peerId), [message.id]))?.[0];
+        // Message mtcute mengekspos isi teks sebagai `.text`, bukan `.message`;
+        // perbandingan versi lama selalu gagal sehingga handler ini langsung
+        // berhenti dan perintahnya tidak pernah jalan.
+        if (!fresh || fresh.text !== message.message) {return;}
+
+        await message.edit({
+          text: '<blockquote>🔍 <b>Mengambil info pengguna...</b></blockquote>',
+          parseMode: 'html'
+        });
+
+        // getSender dulu, fallback getEntity/getChat
+        let target: UserbotEntityLike | LegacyEntity | undefined;
+        try {
+          target = (await replied.getSender()) ?? undefined;
+        } catch (_e) { target = undefined; }
+        if (!target && replied.senderId) {
+          try { target = await client.getEntity(toPeer(replied.senderId)); } catch (_e) { target = undefined; }
+        }
+        if (!target) {
+          try { target = (await message.getChat()) ?? undefined; } catch (_e) { target = undefined; }
+        }
+        if (!target) {
+          await message.edit({
+            text: '<blockquote>❌ <b>Tidak bisa mengambil data pengguna (mungkin anonim/tersembunyi).</b></blockquote>',
+            parseMode: 'html'
+          });
+          return;
+        }
+
+        let caption: string;
+        if (target.className === 'User' || target.className === 'UserEmpty' || !target.className) {
+          let u: UserProfileView | undefined;
+          try {
+            u = await client.getFullUser(toPeer((target.id || target) as EntityLike)) as UserProfileView;
+          } catch (_e) {
+            u = target as UserProfileView;
+          }
+          if (!u) {throw new Error('Data user kosong dari server.');}
+          const name = [u.firstName, u.lastName].filter(Boolean).join(' ') || 'Tanpa Nama';
+          const uname = u.username ? `@${u.username}` : 'Tidak ada';
+          caption =
+            `<blockquote>👤 <b>USER INFO</b>\n` +
+            `📛 <b>Nama:</b> ${escapeHtml(name)}\n` +
+            `🆔 <b>ID:</b> <code>${u.id}</code>\n` +
+            `🔗 <b>Username:</b> ${escapeHtml(uname)}\n` +
+            `🔖 <b>Status:</b> ${statusTags(u)}\n` +
+            `📝 <b>Bio:</b> <i>${escapeHtml(u?.bio || u?.about || 'Tidak ada bio')}</i></blockquote>`;
+        } else {
+          const name = target.title || 'Tanpa Nama';
+          const uname = target.username ? `@${target.username}` : 'Tidak ada';
+          caption =
+            `<blockquote>📣 <b>CHAT INFO</b>\n` +
+            `📛 <b>Nama:</b> ${escapeHtml(name)}\n` +
+            `🆔 <b>ID:</b> <code>${target.id}</code>\n` +
+            `🔗 <b>Username:</b> ${escapeHtml(uname)}\n` +
+            `📌 <b>Tipe:</b> ${escapeHtml(String(target.className ?? 'Chat'))}</blockquote>`;
+        }
+
+        // Foto profil besar
+        let photo: Buffer | string | undefined = undefined;
+        try {
+          photo = await client.downloadProfilePhoto(toPeer((target.id || target) as EntityLike));
+        } catch (e) {
+          Logger.logUser(telegramId, `Profiles: gagal download foto profil: ${e instanceof Error ? e.message : String(e)}`, 'WARN');
+        }
+
+        if (photo && typeof photo !== 'string' && photo.length > 0) {
+          await client.sendMessage(toPeer(message.peerId), {
+            message: caption,
+            file: photo,
+            parseMode: 'html',
+            linkPreview: false
+          });
+          try { await message.delete(); } catch (_e) { /* ignore */ }
+        } else {
+          await message.edit({ text: caption, parseMode: 'html', linkPreview: false });
+        }
+      } catch (err) {
+        Logger.logUser(telegramId, `Profiles .info Error: ${err instanceof Error ? err.message : String(err)}`, 'ERROR');
+        await message.edit({
+          text: `<blockquote>❌ <b>Gagal mengambil info:</b> <i>${escapeHtml(err instanceof Error ? err.message : String(err))}</i></blockquote>`,
+          parseMode: 'html'
+        }).catch(() => {});
+      }
+      return;
+    }
+
+    // ============================================================
+    // .cinfo — info grup/channel di chat saat ini
+    // ============================================================
+    if (cmd === '.cinfo') {
+      try {
+        const chat = await message.getChat();
+        if (!chat || chat.className === 'User') {
+          await message.edit({
+            text: '<blockquote>❌ <b>Gunakan <code>.cinfo</code> di dalam grup/channel.</b></blockquote>',
+            parseMode: 'html'
+          });
+          return;
+        }
+
+        await message.edit({
+          text: '<blockquote>🔍 <b>Mengambil info chat...</b></blockquote>',
+          parseMode: 'html'
+        });
+
+        const title = chat.title || 'Tanpa Nama';
+        const uname = chat.username ? `@${chat.username}` : 'Private';
+        const typeLabel = chat.className === 'Channel' ? (chat.megagroup ? 'Supergroup' : 'Channel') : 'Grup';
+        let about = '';
+        let members: number | string | undefined;
+
+        try {
+          const fullChat = await client.getFullChat(toPeer((chat.id || chat) as EntityLike));
+          // FullChat mtcute menamai deskripsi sebagai `bio`, bukan `description`.
+          about = fullChat?.bio || '';
+          members = fullChat?.membersCount;
+        } catch (_e) {
+          about = '';
+        }
+        if (members === undefined || members === null) {
+          members = chat.participantsCount ?? 'Tidak diketahui';
+        }
+
+        const text =
+          `<blockquote>👥 <b>CHAT INFO</b>\n` +
+          `📌 <b>Nama:</b> ${escapeHtml(title)}\n` +
+          `🆔 <b>ID:</b> <code>${chat.id}</code>\n` +
+          `🔗 <b>Username:</b> ${escapeHtml(uname)}\n` +
+          `📌 <b>Tipe:</b> ${escapeHtml(typeLabel)}\n` +
+          `👥 <b>Member:</b> ${escapeHtml(String(members))}\n` +
+          `📝 <b>Deskripsi:</b>\n<i>${escapeHtml(about || 'Tidak ada deskripsi')}</i></blockquote>`;
+
+        await message.edit({ text, parseMode: 'html', linkPreview: false });
+      } catch (err) {
+        Logger.logUser(telegramId, `Profiles .cinfo Error: ${err instanceof Error ? err.message : String(err)}`, 'ERROR');
+        await message.edit({
+          text: `<blockquote>❌ <b>Gagal mengambil info chat:</b> <i>${escapeHtml(err instanceof Error ? err.message : String(err))}</i></blockquote>`,
+          parseMode: 'html'
+        }).catch(() => {});
+      }
+      return;
+    }
+  }
+};
